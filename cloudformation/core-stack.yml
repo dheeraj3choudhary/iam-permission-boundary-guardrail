@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM Guardrail Solution - Core Stack
+  Deploys foundational resources: Permission Boundary Policy, DynamoDB audit table,
+  SNS topic for Teams notification, and Lambda execution role.
+
+# -------------------------------------------------------
+# PARAMETERS
+# -------------------------------------------------------
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  TeamsWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: Microsoft Teams incoming webhook URL for security channel alerts
+
+  AuditTableName:
+    Type: String
+    Default: iam-guardrail-audit
+    Description: DynamoDB table name for audit trail
+
+# -------------------------------------------------------
+# RESOURCES
+# -------------------------------------------------------
+Resources:
+
+  # -----------------------------------------------------
+  # 1. PERMISSION BOUNDARY POLICY
+  #    This is the policy that will be automatically
+  #    attached to every new IAM Role created in the account
+  # -----------------------------------------------------
+  IAMPermissionBoundaryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "iam-guardrail-permission-boundary-${Environment}"
+      Description: >
+        Permission boundary automatically enforced on all newly created IAM roles.
+        Restricts maximum permissions a role can have regardless of attached policies.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # Allow common AWS service actions needed by application roles
+          - Sid: AllowCoreServiceActions
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:UpdateItem
+              - lambda:InvokeFunction
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logsogs:PutLogEvents
+              - cloudwatch:PutMetricData
+              - sns:Publish
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - ec2:DescribeInstances
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+            Resource: "*"
+
+          # Explicitly deny all IAM privilege escalation actions
+          # Roles within boundary CANNOT create/modify IAM resources
+          - Sid: DenyIAMPrivilegeEscalation
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreateRole
+              - iam:AttachRolePolicy
+              - iam:AttachUserPolicy
+              - iam:PutRolePolicy
+              - iam:PutUserPolicy
+              - iam:CreatePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:PassRole
+              - iam:DeleteRolePermissionsBoundary
+              - iam:DeleteUserPermissionsBoundary
+            Resource: "*"
+
+          # Deny access to other accounts (prevent data exfiltration)
+          - Sid: DenyOrganizationLeave
+            Effect: Deny
+            Action:
+              - organizations:LeaveOrganization
+            Resource: "*"
+
+  # -----------------------------------------------------
+  # 2. DYNAMODB AUDIT TABLE
+  #    Stores every enforcement action taken by Lambda
+  #    Partition key: accountId, Sort key: timestamp
+  #    TTL enabled - records expire after 1 year
+  # -----------------------------------------------------
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain        # NEVER delete audit table even if stack is torn down
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AuditTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST  # No capacity planning needed
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true            # Encrypt audit records at rest
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true               # Auto-expire records after 1 year
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Solution
+          Value: iam-guardrail
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -----------------------------------------------------
+  # 3. SNS TOPIC
+  #    Lambda publishes enforcement alerts here
+  #    Subscribed by a Lambda that forwards to Teams webhook
+  # -----------------------------------------------------
+  GuardrailAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "iam-guardrail-alerts-${Environment}"
+      DisplayName: IAM Guardrail Security Alerts
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Solution
+          Value: iam-guardrail
+
+  # Store Teams webhook URL securely in SSM Parameter Store
+  # Lambda reads this at runtime - never hardcoded
+  TeamsWebhookParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/iam-guardrail/${Environment}/teams-webhook-url"
+      Type: String
+      Value: !Ref TeamsWebhookUrl
+      Description: Microsoft Teams webhook URL for IAM guardrail security alerts
+      Tags:
+        Environment: !Ref Environment
+        Solution: iam-guardrail
+
+  # -----------------------------------------------------
+  # 4. LAMBDA EXECUTION ROLE
+  #    Least privilege role for the guardrail Lambda
+  #    Only permissions it actually needs - nothing more
+  # -----------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iam-guardrail-lambda-role-${Environment}"
+      Description: Execution role for IAM Guardrail Lambda function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      # Attach permission boundary to the Lambda role itself
+      # Prevents the guardrail Lambda from being used for escalation
+      PermissionsBoundary: !Ref IAMPermissionBoundaryPolicy
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: IAMGuardrailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # Allow Lambda to attach permission boundary to new roles
+              - Sid: AllowBoundaryAttachment
+                Effect: Allow
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:GetRole
+                  - iam:DeleteRole
+                  - iam:ListAttachedRolePolicies
+                Resource: "*"
+
+              # Allow Lambda to write audit records to DynamoDB
+              - Sid: AllowDynamoDBAudit
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt AuditTable.Arn
+
+              # Allow Lambda to publish alerts to SNS
+              - Sid: AllowSNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref GuardrailAlertTopic
+
+              # Allow Lambda to read Teams webhook URL from SSM
+              - Sid: AllowSSMRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/iam-guardrail/${Environment}/*"
+
+              # Allow Lambda to read CloudTrail event details
+              - Sid: AllowCloudTrailRead
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: "*"
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Solution
+          Value: iam-guardrail
+
+# -------------------------------------------------------
+# OUTPUTS
+# These are consumed by app-stack.yml as imports
+# -------------------------------------------------------
+Outputs:
+
+  PermissionBoundaryPolicyArn:
+    Description: ARN of the Permission Boundary Policy
+    Value: !Ref IAMPermissionBoundaryPolicy
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-boundary-policy-arn"
+
+  AuditTableName:
+    Description: DynamoDB audit table name
+    Value: !Ref AuditTable
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-audit-table-name"
+
+  AuditTableArn:
+    Description: DynamoDB audit table ARN
+    Value: !GetAtt AuditTable.Arn
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-audit-table-arn"
+
+  AlertTopicArn:
+    Description: SNS topic ARN for guardrail alerts
+    Value: !Ref GuardrailAlertTopic
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-alert-topic-arn"
+
+  LambdaExecutionRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-lambda-role-arn"
+
+  TeamsWebhookParameterName:
+    Description: SSM parameter name for Teams webhook URL
+    Value: !Ref TeamsWebhookParameter
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-teams-webhook-param"

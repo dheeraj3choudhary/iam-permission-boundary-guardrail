@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM Guardrail Solution - App Stack
+  Deploys application resources: Lambda function and EventBridge rules.
+  Depends on core-stack.yml being deployed first.
+
+# -------------------------------------------------------
+# PARAMETERS
+# -------------------------------------------------------
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512]
+    Description: Lambda memory size in MB
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda timeout in seconds - keep low, this must react fast
+
+  # Role name prefixes that should be EXCLUDED from boundary enforcement
+  # e.g. break-glass roles, existing platform roles managed separately
+  AllowlistRolePrefixes:
+    Type: String
+    Default: "iam-guardrail-,AWSServiceRole,OrganizationAccountAccessRole"
+    Description: Comma-separated role name prefixes to skip boundary enforcement
+
+# -------------------------------------------------------
+# RESOURCES
+# -------------------------------------------------------
+Resources:
+
+  # -----------------------------------------------------
+  # 1. LAMBDA FUNCTION
+  #    Core enforcement engine
+  #    Triggered by EventBridge on IAM events
+  # -----------------------------------------------------
+  GuardrailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "iam-guardrail-enforcer-${Environment}"
+      Description: >
+        Automatically enforces permission boundaries on newly created IAM roles.
+        Triggered by CloudTrail events via EventBridge.
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role:
+        Fn::ImportValue: !Sub "iam-guardrail-${Environment}-lambda-role-arn"
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: 10   # Prevent runaway invocations
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          AUDIT_TABLE_NAME:
+            Fn::ImportValue: !Sub "iam-guardrail-${Environment}-audit-table-name"
+          ALERT_TOPIC_ARN:
+            Fn::ImportValue: !Sub "iam-guardrail-${Environment}-alert-topic-arn"
+          BOUNDARY_POLICY_ARN:
+            Fn::ImportValue: !Sub "iam-guardrail-${Environment}-boundary-policy-arn"
+          TEAMS_WEBHOOK_PARAM:
+            Fn::ImportValue: !Sub "iam-guardrail-${Environment}-teams-webhook-param"
+          ALLOWLIST_PREFIXES: !Ref AllowlistRolePrefixes
+
+      # Inline code placeholder - GitHub Actions will update this
+      # via aws lambda update-function-code after CFN deploy
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "placeholder"}
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Solution
+          Value: iam-guardrail
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # CloudWatch Log Group for Lambda - explicit so we control retention
+  GuardrailLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/iam-guardrail-enforcer-${Environment}"
+      RetentionInDays: 90     # 90 days log retention for security logs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------------------------------
+  # 2. EVENTBRIDGE RULES
+  #    Three separate rules for the three IAM events
+  #    we care about:
+  #    - CreateRole
+  #    - AttachRolePolicy
+  #    - PutRolePolicy
+  # -----------------------------------------------------
+
+  # Rule 1: Fires when a new IAM Role is created
+  CreateRoleEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "iam-guardrail-create-role-${Environment}"
+      Description: Triggers guardrail Lambda when a new IAM role is created
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateRole
+          errorCode:
+            - exists: false     # Only process successful API calls
+      Targets:
+        - Id: GuardrailLambdaTarget
+          Arn: !GetAtt GuardrailLambda.Arn
+
+  # Rule 2: Fires when a managed policy is attached to a role
+  AttachRolePolicyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "iam-guardrail-attach-policy-${Environment}"
+      Description: Triggers guardrail Lambda when a managed policy is attached to a role
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - AttachRolePolicy
+          errorCode:
+            - exists: false
+      Targets:
+        - Id: GuardrailLambdaTarget
+          Arn: !GetAtt GuardrailLambda.Arn
+
+  # Rule 3: Fires when an inline policy is put on a role
+  PutRolePolicyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "iam-guardrail-put-policy-${Environment}"
+      Description: Triggers guardrail Lambda when an inline policy is added to a role
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - PutRolePolicy
+          errorCode:
+            - exists: false
+      Targets:
+        - Id: GuardrailLambdaTarget
+          Arn: !GetAtt GuardrailLambda.Arn
+
+  # -----------------------------------------------------
+  # 3. LAMBDA PERMISSIONS
+  #    Allow each EventBridge rule to invoke Lambda
+  # -----------------------------------------------------
+  LambdaPermissionCreateRole:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GuardrailLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CreateRoleEventRule.Arn
+
+  LambdaPermissionAttachPolicy:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GuardrailLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AttachRolePolicyEventRule.Arn
+
+  LambdaPermissionPutPolicy:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GuardrailLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PutRolePolicyEventRule.Arn
+
+  # -----------------------------------------------------
+  # 4. CLOUDWATCH ALARM
+  #    Alert if Lambda starts throwing errors
+  #    Critical - if enforcer fails, security gap opens
+  # -----------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "iam-guardrail-lambda-errors-${Environment}"
+      AlarmDescription: >
+        CRITICAL: IAM Guardrail Lambda is failing.
+        Permission boundaries may not be getting enforced.
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GuardrailLambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub "iam-guardrail-${Environment}-alert-topic-arn"
+      OKActions:
+        - Fn::ImportValue: !Sub "iam-guardrail-${Environment}-alert-topic-arn"
+
+# -------------------------------------------------------
+# OUTPUTS
+# -------------------------------------------------------
+Outputs:
+
+  GuardrailLambdaArn:
+    Description: ARN of the Guardrail Lambda function
+    Value: !GetAtt GuardrailLambda.Arn
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-lambda-arn"
+
+  GuardrailLambdaName:
+    Description: Name of the Guardrail Lambda function
+    Value: !Ref GuardrailLambda
+    Export:
+      Name: !Sub "iam-guardrail-${Environment}-lambda-name"
+
+  CreateRoleRuleArn:
+    Description: EventBridge rule ARN for CreateRole events
+    Value: !GetAtt CreateRoleEventRule.Arn
+
+  AttachPolicyRuleArn:
+    Description: EventBridge rule ARN for AttachRolePolicy events
+    Value: !GetAtt AttachRolePolicyEventRule.Arn
+
+  PutPolicyRuleArn:
+    Description: EventBridge rule ARN for PutRolePolicy events
+    Value: !GetAtt PutRolePolicyEventRule.Arn

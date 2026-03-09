@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Lambda build artifact
+lambda.zip
+
+# Environment variables - never commit secrets
+.env
+*.env
+
+# AWS credentials - never commit
+.aws/
+credentials
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
