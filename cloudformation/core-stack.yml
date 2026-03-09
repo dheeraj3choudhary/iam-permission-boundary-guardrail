@@ -61,7 +61,7 @@ Resources:
               - lambda:InvokeFunction
               - logs:CreateLogGroup
               - logs:CreateLogStream
-              - logsogs:PutLogEvents
+              - logs:PutLogEvents
               - cloudwatch:PutMetricData
               - sns:Publish
               - sqs:SendMessage
