@@ -39,7 +39,7 @@ jobs:
           cfn-lint cloudformation/app-stack.yml
 
       - name: Run unit tests
-        run: pytest tests/ -v --tb=short --pythonpath lambda
+        run: PYTHONPATH=lambda pytest tests/ -v --tb=short
 
   # -------------------------------------------------------
   # JOB 2: DEPLOY
