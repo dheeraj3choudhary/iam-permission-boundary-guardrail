@@ -39,7 +39,7 @@ jobs:
           cfn-lint cloudformation/app-stack.yml
 
       - name: Run unit tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --pythonpath lambda
 
   # -------------------------------------------------------
   # JOB 2: DEPLOY
@@ -131,7 +131,7 @@ jobs:
           curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d '{
-              "text": "✅ IAM Guardrail deployed successfully to ${{ env.ENVIRONMENT }}"
+              "text": "IAM Guardrail deployed successfully to ${{ env.ENVIRONMENT }}"
             }'
 
       - name: Notify Teams on failure
@@ -140,5 +140,5 @@ jobs:
           curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d '{
-              "text": "🔴 IAM Guardrail deployment FAILED in ${{ env.ENVIRONMENT }} - immediate attention required"
+              "text": "IAM Guardrail deployment FAILED in ${{ env.ENVIRONMENT }} - immediate attention required"
             }'

@@ -6,10 +6,14 @@ Uses moto to mock AWS services - no real AWS calls made during tests.
 """
 
 import os
+import sys
 import json
 import pytest
 import boto3
 from moto import mock_aws
+
+# Add lambda directory to path so tests can find modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
 
 # -------------------------------------------------------
 # SET DUMMY ENV VARS BEFORE ANY IMPORTS
